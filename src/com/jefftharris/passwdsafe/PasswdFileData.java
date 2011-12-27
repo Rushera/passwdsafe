@@ -1,0 +1,1015 @@
+/*
+ * Copyright (©) 2009-2011 Jeff Harris <jefftharris@gmail.com>
+ * All rights reserved. Use of the code is allowed under the
+ * Artistic License 2.0 terms, as specified in the LICENSE file
+ * distributed with this code, or available from
+ * http://www.opensource.org/licenses/artistic-license-2.0.php
+ */
+package com.jefftharris.passwdsafe;
+
+import java.io.File;
+import java.io.FileFilter;
+import java.io.IOException;
+import java.io.UnsupportedEncodingException;
+import java.security.NoSuchAlgorithmException;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.ConcurrentModificationException;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import org.pwsafe.lib.UUID;
+import org.pwsafe.lib.Util;
+import org.pwsafe.lib.exception.EndOfFileException;
+import org.pwsafe.lib.exception.InvalidPassphraseException;
+import org.pwsafe.lib.exception.PasswordSafeException;
+import org.pwsafe.lib.exception.UnsupportedFileVersionException;
+import org.pwsafe.lib.file.PwsField;
+import org.pwsafe.lib.file.PwsFieldTypeV2;
+import org.pwsafe.lib.file.PwsFieldTypeV3;
+import org.pwsafe.lib.file.PwsFile;
+import org.pwsafe.lib.file.PwsFileFactory;
+import org.pwsafe.lib.file.PwsFileStorage;
+import org.pwsafe.lib.file.PwsFileV1;
+import org.pwsafe.lib.file.PwsFileV2;
+import org.pwsafe.lib.file.PwsFileV3;
+import org.pwsafe.lib.file.PwsPasswdField;
+import org.pwsafe.lib.file.PwsPasswdUnicodeField;
+import org.pwsafe.lib.file.PwsRecord;
+import org.pwsafe.lib.file.PwsRecordV1;
+import org.pwsafe.lib.file.PwsRecordV2;
+import org.pwsafe.lib.file.PwsRecordV3;
+import org.pwsafe.lib.file.PwsStorage;
+import org.pwsafe.lib.file.PwsStringField;
+import org.pwsafe.lib.file.PwsStringUnicodeField;
+import org.pwsafe.lib.file.PwsUUIDField;
+import org.pwsafe.lib.file.PwsUnknownField;
+
+import android.content.Context;
+import android.content.SharedPreferences;
+import android.os.Build;
+import android.preference.PreferenceManager;
+import android.text.TextUtils;
+import android.util.Log;
+
+public class PasswdFileData
+{
+    private File itsFile;
+    private PwsFile itsPwsFile;
+    private final HashMap<String, PwsRecord> itsRecordsByUUID =
+        new HashMap<String, PwsRecord>();
+    private final ArrayList<PwsRecord> itsRecords = new ArrayList<PwsRecord>();
+    private boolean itsIsOpenReadOnly = false;
+
+    private static final String TAG = "PasswdFileData";
+
+    private static final int FIELD_UNSUPPORTED = -1;
+    private static final int FIELD_NOT_PRESENT = -2;
+
+    public PasswdFileData(File file)
+    {
+        itsFile = file;
+    }
+
+    public void load(StringBuilder passwd, boolean readonly)
+        throws IOException, NoSuchAlgorithmException,
+            EndOfFileException, InvalidPassphraseException,
+            UnsupportedFileVersionException
+    {
+        PasswdSafeApp.dbginfo(TAG, "before load file");
+        itsIsOpenReadOnly = readonly;
+        itsPwsFile = PwsFileFactory.loadFile(itsFile.getAbsolutePath(), passwd);
+        if (!itsFile.canWrite() || itsIsOpenReadOnly) {
+            itsPwsFile.setReadOnly(true);
+        }
+        finishOpenFile(passwd);
+    }
+
+    public void createNewFile(StringBuilder passwd, Context context)
+        throws IOException, NoSuchAlgorithmException
+    {
+        itsPwsFile = PwsFileFactory.newFile();
+        itsPwsFile.setPassphrase(passwd);
+        itsPwsFile.setStorage(new PwsFileStorage(itsFile.getAbsolutePath()));
+        setSaveHdrFields(context);
+        itsPwsFile.save();
+        finishOpenFile(passwd);
+    }
+
+    public void save(final Context context)
+        throws IOException, NoSuchAlgorithmException,
+               ConcurrentModificationException
+    {
+        if (itsPwsFile != null) {
+            for (int idx = 0; idx < itsRecords.size(); ++idx) {
+                PwsRecord rec = itsRecords.get(idx);
+                if (rec.isModified()) {
+                    PasswdSafeApp.dbginfo(TAG, "Updating idx: " + idx);
+                    itsPwsFile.set(idx, rec);
+                    rec.resetModified();
+                }
+            }
+
+            setSaveHdrFields(context);
+
+            itsPwsFile.getStorage().setSaveHelper(new PwsStorage.SaveHelper()
+            {
+                public String getSaveFileName(File file, boolean isV3)
+                {
+                    return PasswdFileData.getSaveFileName(file, isV3);
+                }
+
+                public void createBackupFile(File fromFile, File toFile)
+                    throws IOException
+                {
+                    PasswdFileData.createBackupFile(fromFile, toFile, context);
+                }
+            });
+            try {
+                itsPwsFile.save();
+            } finally {
+                itsPwsFile.getStorage().setSaveHelper(null);
+            }
+        }
+    }
+
+    public void close()
+    {
+        itsFile = null;
+        itsPwsFile.dispose();
+        itsPwsFile = null;
+        itsRecordsByUUID.clear();
+        itsRecords.clear();
+    }
+
+    public ArrayList<PwsRecord> getRecords()
+    {
+        return itsRecords;
+    }
+
+    public PwsRecord getRecord(String uuid)
+    {
+        return itsRecordsByUUID.get(uuid);
+    }
+
+    public PwsRecord createRecord()
+    {
+        if (itsPwsFile != null) {
+            return itsPwsFile.newRecord();
+        } else {
+            return null;
+        }
+    }
+
+    public final void addRecord(PwsRecord rec)
+        throws PasswordSafeException
+    {
+        if (itsPwsFile != null) {
+            itsPwsFile.add(rec);
+            indexRecords();
+        }
+    }
+
+    public final boolean removeRecord(PwsRecord rec)
+    {
+        if (itsPwsFile != null) {
+            String recuuid = getUUID(rec);
+            if (recuuid == null) {
+                return false;
+            }
+
+            for (int i = 0; i < itsRecords.size(); ++i) {
+                PwsRecord r = itsRecords.get(i);
+                String ruuid = getUUID(r);
+                if (recuuid.equals(ruuid)) {
+                    boolean rc = itsPwsFile.removeRecord(i);
+                    if (rc) {
+                        indexRecords();
+                    }
+                    return rc;
+                }
+            }
+        }
+        return false;
+    }
+
+    public final void changePasswd(StringBuilder passwd)
+    {
+        itsPwsFile.setPassphrase(passwd);
+    }
+
+    public final File getFile()
+    {
+        return itsFile;
+    }
+
+    public final boolean canEdit()
+    {
+        return !itsIsOpenReadOnly &&
+               (itsPwsFile != null) &&
+               !itsPwsFile.isReadOnly() &&
+               ((itsPwsFile.getFileVersionMajor() == PwsFileV3.VERSION) ||
+                (itsPwsFile.getFileVersionMajor() == PwsFileV2.VERSION));
+    }
+
+    public final boolean canDelete()
+    {
+        return !itsIsOpenReadOnly && itsFile.canWrite();
+    }
+
+    public final boolean isV3()
+    {
+        return (itsPwsFile != null) &&
+            (itsPwsFile.getFileVersionMajor() == PwsFileV3.VERSION);
+    }
+
+    public final boolean isV2()
+    {
+        return (itsPwsFile != null) &&
+            (itsPwsFile.getFileVersionMajor() == PwsFileV2.VERSION);
+    }
+
+    public final String getOpenPasswordEncoding()
+    {
+        return (itsPwsFile != null) ? itsPwsFile.getOpenPasswordEncoding() :
+            null;
+    }
+
+    public final String getEmail(PwsRecord rec)
+    {
+        return getField(rec, PwsRecordV3.EMAIL);
+    }
+
+    public final void setEmail(String str, PwsRecord rec)
+    {
+        setField(str, rec, PwsRecordV3.EMAIL);
+    }
+
+    public final String getGroup(PwsRecord rec)
+    {
+        return getField(rec, PwsRecordV3.GROUP);
+    }
+
+    public final void setGroup(String str, PwsRecord rec)
+    {
+        setField(str, rec, PwsRecordV3.GROUP);
+    }
+
+    public final String getNotes(PwsRecord rec)
+    {
+        String s = getField(rec, PwsRecordV3.NOTES);
+        if (s != null) {
+            s = s.replace("\r\n", "\n");
+        }
+        return s;
+    }
+
+    public final void setNotes(String str, PwsRecord rec)
+    {
+        str = str.replace("\n", "\r\n");
+        setField(str, rec, PwsRecordV3.NOTES);
+    }
+
+    public final String getPassword(PwsRecord rec)
+    {
+        return getField(rec, PwsRecordV3.PASSWORD);
+    }
+
+    public final boolean hasPassword(PwsRecord rec)
+    {
+        return hasField(rec, PwsRecordV3.PASSWORD);
+    }
+
+    public final void setPassword(String oldPasswd, String newPasswd,
+                                  PwsRecord rec)
+    {
+        PasswdHistory history = getPasswdHistory(rec);
+        if ((history != null) && !TextUtils.isEmpty(oldPasswd)) {
+            history.addPasswd(oldPasswd);
+            setPasswdHistory(history, rec);
+        }
+        setField(newPasswd, rec, PwsRecordV3.PASSWORD);
+    }
+
+    public final String getPasswdExpiryTime(PwsRecord rec)
+    {
+        return getField(rec, PwsRecordV3.PASSWORD_LIFETIME);
+    }
+
+    public final PasswdHistory getPasswdHistory(PwsRecord rec)
+    {
+        String fieldStr = getField(rec, PwsRecordV3.PASSWORD_HISTORY);
+        if (!TextUtils.isEmpty(fieldStr)) {
+            try {
+                return new PasswdHistory(fieldStr);
+            } catch (Exception e) {
+                Log.e(TAG, "Error reading password history: " + e, e);
+            }
+        }
+        return null;
+    }
+
+    public final void setPasswdHistory(PasswdHistory history, PwsRecord rec)
+    {
+        setField((history == null) ? null : history.toString(),
+                 rec, PwsRecordV3.PASSWORD_HISTORY);
+    }
+
+    public final String getTitle(PwsRecord rec)
+    {
+        return getField(rec, PwsRecordV3.TITLE);
+    }
+
+    public final void setTitle(String str, PwsRecord rec)
+    {
+        setField(str, rec, PwsRecordV3.TITLE);
+    }
+
+    public final String getUsername(PwsRecord rec)
+    {
+        return getField(rec, PwsRecordV3.USERNAME);
+    }
+
+    public final void setUsername(String str, PwsRecord rec)
+    {
+        setField(str, rec, PwsRecordV3.USERNAME);
+    }
+
+    public final String getURL(PwsRecord rec)
+    {
+        return getField(rec, PwsRecordV3.URL);
+    }
+
+    public final void setURL(String str, PwsRecord rec)
+    {
+        setField(str, rec, PwsRecordV3.URL);
+    }
+
+    public final String getUUID(PwsRecord rec)
+    {
+        return getField(rec, PwsRecordV3.UUID);
+    }
+
+    public final String getHdrVersion()
+    {
+        return getHdrField(PwsRecordV3.HEADER_VERSION);
+    }
+
+    public final String getHdrLastSaveUser()
+    {
+        return getHdrField(PwsRecordV3.HEADER_LAST_SAVE_USER);
+    }
+
+    public final void setHdrLastSaveUser(String user)
+    {
+        setHdrField(PwsRecordV3.HEADER_LAST_SAVE_USER, user);
+    }
+
+    public final String getHdrLastSaveHost()
+    {
+        return getHdrField(PwsRecordV3.HEADER_LAST_SAVE_HOST);
+    }
+
+    public final void setHdrLastSaveHost(String host)
+    {
+        setHdrField(PwsRecordV3.HEADER_LAST_SAVE_HOST, host);
+    }
+
+    public final String getHdrLastSaveApp()
+    {
+        return getHdrField(PwsRecordV3.HEADER_LAST_SAVE_WHAT);
+    }
+
+    public final void setHdrLastSaveApp(String app)
+    {
+        setHdrField(PwsRecordV3.HEADER_LAST_SAVE_WHAT, app);
+    }
+
+    public final String getHdrLastSaveTime()
+    {
+        return getHdrField(PwsRecordV3.HEADER_LAST_SAVE_TIME);
+    }
+
+    public final void setHdrLastSaveTime(Date date)
+    {
+        setHdrField(PwsRecordV3.HEADER_LAST_SAVE_TIME, date);
+    }
+
+    public static final int hexBytesToInt(byte[] bytes, int pos, int len)
+    {
+        int i = 0;
+        for (int idx = pos; idx < (pos + len); ++idx) {
+            i <<= 4;
+            i |= Character.digit(bytes[idx], 16);
+        }
+        return i;
+    }
+
+    private final void setSaveHdrFields(Context context)
+    {
+        setHdrLastSaveApp(PasswdSafeApp.getAppTitle(context) +
+                          " " +
+                          PasswdSafeApp.getAppVersion(context));
+        setHdrLastSaveUser("User");
+        setHdrLastSaveHost(Build.MODEL);
+        setHdrLastSaveTime(new Date());
+
+    }
+
+    private final String getField(PwsRecord rec, int fieldId)
+    {
+        if (itsPwsFile == null) {
+            return "";
+        }
+
+        return doGetFieldStr(rec, getVersionFieldId(fieldId));
+    }
+
+    private final boolean hasField(PwsRecord rec, int fieldId)
+    {
+        return doGetField(rec, getVersionFieldId(fieldId)) != null;
+    }
+
+    private final int getVersionFieldId(int fieldId)
+    {
+        if (itsPwsFile == null) {
+            return FIELD_NOT_PRESENT;
+        }
+
+        switch (itsPwsFile.getFileVersionMajor())
+        {
+        case PwsFileV3.VERSION:
+        {
+            break;
+        }
+        case PwsFileV2.VERSION:
+        {
+            switch (fieldId)
+            {
+            case PwsRecordV3.GROUP:
+            {
+                fieldId = PwsRecordV2.GROUP;
+                break;
+            }
+            case PwsRecordV3.NOTES:
+            {
+                fieldId = PwsRecordV2.NOTES;
+                break;
+            }
+            case PwsRecordV3.PASSWORD:
+            {
+                fieldId = PwsRecordV2.PASSWORD;
+                break;
+            }
+            case PwsRecordV3.PASSWORD_LIFETIME:
+            {
+                fieldId = PwsRecordV2.PASSWORD_LIFETIME;
+                break;
+            }
+            case PwsRecordV3.TITLE:
+            {
+                fieldId = PwsRecordV2.TITLE;
+                break;
+            }
+            case PwsRecordV3.USERNAME:
+            {
+                fieldId = PwsRecordV2.USERNAME;
+                break;
+            }
+            case PwsRecordV3.UUID:
+            {
+                fieldId = PwsRecordV2.UUID;
+                break;
+            }
+            case PwsRecordV3.EMAIL:
+            case PwsRecordV3.URL:
+            case PwsRecordV3.PASSWORD_HISTORY:
+            {
+                fieldId = FIELD_NOT_PRESENT;
+                break;
+            }
+            }
+            break;
+        }
+        case PwsFileV1.VERSION:
+        {
+            switch (fieldId)
+            {
+            case PwsRecordV3.NOTES:
+            {
+                fieldId = PwsRecordV1.NOTES;
+                break;
+            }
+            case PwsRecordV3.PASSWORD:
+            {
+                fieldId = PwsRecordV1.PASSWORD;
+                break;
+            }
+            case PwsRecordV3.TITLE:
+            {
+                fieldId = PwsRecordV1.TITLE;
+                break;
+            }
+            case PwsRecordV3.USERNAME:
+            {
+                fieldId = PwsRecordV1.USERNAME;
+                break;
+            }
+            case PwsRecordV3.UUID:
+            {
+                // No real UUID field for V1, so just use the phantom one
+                fieldId = PwsRecordV1.UUID;
+                break;
+            }
+            case PwsRecordV3.EMAIL:
+            case PwsRecordV3.GROUP:
+            case PwsRecordV3.PASSWORD_LIFETIME:
+            case PwsRecordV3.URL:
+            case PwsRecordV3.PASSWORD_HISTORY:
+            {
+                fieldId = FIELD_NOT_PRESENT;
+                break;
+            }
+            }
+            break;
+        }
+        default:
+        {
+            fieldId = FIELD_UNSUPPORTED;
+            break;
+        }
+        }
+
+        return fieldId;
+    }
+
+
+    private final String getHdrField(int fieldId)
+    {
+        if (itsPwsFile == null) {
+            return "";
+        }
+
+        switch (itsPwsFile.getFileVersionMajor())
+        {
+        case PwsFileV3.VERSION:
+        {
+            break;
+        }
+        case PwsFileV2.VERSION:
+        case PwsFileV1.VERSION:
+        {
+            fieldId = FIELD_NOT_PRESENT;
+            break;
+        }
+        default:
+        {
+            fieldId = FIELD_UNSUPPORTED;
+            break;
+        }
+        }
+
+        if (isV3()) {
+            PwsRecord rec = ((PwsFileV3)itsPwsFile).getHeaderRecord();
+            switch (fieldId)
+            {
+            case PwsRecordV3.HEADER_VERSION:
+            {
+                return String.format("%d.%02d", 3, getHdrMinorVersion(rec));
+            }
+            case PwsRecordV3.HEADER_LAST_SAVE_TIME:
+            {
+                PwsField time = doGetField(rec, fieldId);
+                if (time == null) {
+                    return null;
+                }
+                byte[] bytes = time.getBytes();
+                if (bytes.length == 8)
+                {
+                    byte[] binbytes = new byte[4];
+                    Util.putIntToByteArray(
+                        binbytes, hexBytesToInt(bytes, 0, bytes.length), 0);
+                    bytes = binbytes;
+                }
+                Date d = new Date(Util.getMillisFromByteArray(bytes, 0));
+                return d.toString();
+            }
+            case PwsRecordV3.HEADER_LAST_SAVE_USER:
+            {
+                PwsField field = doGetField(rec, fieldId);
+                if (field != null) {
+                    return doHdrFieldToString(field);
+                }
+
+                return getHdrLastSaveWhoField(rec, true);
+            }
+            case PwsRecordV3.HEADER_LAST_SAVE_HOST:
+            {
+                PwsField field = doGetField(rec, fieldId);
+                if (field != null) {
+                    return doHdrFieldToString(field);
+                }
+
+                return getHdrLastSaveWhoField(rec, false);
+            }
+            case PwsRecordV3.HEADER_LAST_SAVE_WHO:
+            case PwsRecordV3.HEADER_LAST_SAVE_WHAT:
+            {
+                PwsField field = doGetField(rec, fieldId);
+                if (field != null) {
+                    return doHdrFieldToString(field);
+                }
+                return null;
+            }
+            default:
+            {
+                return null;
+            }
+            }
+        } else {
+            return null;
+        }
+    }
+
+    private final void setHdrField(int fieldId, Object value)
+    {
+        if (itsPwsFile == null) {
+            return;
+        }
+
+        if (isV3()) {
+            PwsRecord rec = ((PwsFileV3)itsPwsFile).getHeaderRecord();
+            switch (fieldId)
+            {
+            case PwsRecordV3.HEADER_LAST_SAVE_TIME:
+            {
+                long timeVal = ((Date)value).getTime();
+                byte[] newbytes;
+                int minor = getHdrMinorVersion(rec);
+                if (minor >= 2) {
+                    newbytes = new byte[4];
+                    Util.putMillisToByteArray(newbytes, timeVal, 0);
+                } else {
+                    int secs = (int) (timeVal / 1000);
+                    String str = String.format("%08x", secs);
+                    newbytes = str.getBytes();
+                }
+                rec.setField(new PwsUnknownField(fieldId, newbytes));
+                break;
+            }
+            case PwsRecordV3.HEADER_LAST_SAVE_WHAT:
+            {
+                doSetHdrFieldString(rec, PwsRecordV3.HEADER_LAST_SAVE_WHAT,
+                                    value.toString());
+                break;
+            }
+            case PwsRecordV3.HEADER_LAST_SAVE_USER:
+            {
+                int minor = getHdrMinorVersion(rec);
+                if (minor >= 2) {
+                    doSetHdrFieldString(rec, PwsRecordV3.HEADER_LAST_SAVE_USER,
+                                        value.toString());
+                } else {
+                    setHdrLastSaveWhoField(rec, value.toString(),
+                                           getHdrLastSaveWhoField(rec, false));
+                }
+                break;
+            }
+            case PwsRecordV3.HEADER_LAST_SAVE_HOST:
+            {
+                int minor = getHdrMinorVersion(rec);
+                if (minor >= 2) {
+                    doSetHdrFieldString(rec, PwsRecordV3.HEADER_LAST_SAVE_HOST,
+                                        value.toString());
+                } else {
+                    setHdrLastSaveWhoField(rec,
+                                           getHdrLastSaveWhoField(rec, true),
+                                           value.toString());
+                }
+                break;
+            }
+            default:
+            {
+                break;
+            }
+            }
+        }
+    }
+
+
+    private static String doHdrFieldToString(PwsField field)
+    {
+        try {
+            return new String(field.getBytes(), "UTF-8");
+        }
+        catch (UnsupportedEncodingException e) {
+            return null;
+        }
+    }
+
+
+    private static void doSetHdrFieldString(PwsRecord rec,
+                                            int fieldId, String val)
+    {
+        try {
+            PwsField f = new PwsUnknownField(fieldId, val.getBytes("UTF-8"));
+            rec.setField(f);
+        }
+        catch (UnsupportedEncodingException e) {
+        }
+    }
+
+
+    private final String doGetFieldStr(PwsRecord rec, int fieldId)
+    {
+        switch (fieldId)
+        {
+        case FIELD_UNSUPPORTED:
+        {
+            return "(unsupported)";
+        }
+        case FIELD_NOT_PRESENT:
+        {
+            return null;
+        }
+        default:
+        {
+            PwsField field = rec.getField(fieldId);
+            if (field == null) {
+                return null;
+            }
+            return field.toString();
+        }
+        }
+    }
+
+    private static final PwsField doGetField(PwsRecord rec, int fieldId)
+    {
+        switch (fieldId)
+        {
+        case FIELD_UNSUPPORTED:
+        case FIELD_NOT_PRESENT:
+        {
+            return null;
+        }
+        default:
+        {
+            return rec.getField(fieldId);
+        }
+        }
+    }
+
+    private final void setField(String str, PwsRecord rec, int fieldId)
+    {
+        PwsField field = null;
+        switch (itsPwsFile.getFileVersionMajor())
+        {
+        case PwsFileV3.VERSION:
+        {
+            switch (fieldId)
+            {
+            case PwsRecordV3.EMAIL:
+            case PwsRecordV3.GROUP:
+            case PwsRecordV3.NOTES:
+            case PwsRecordV3.TITLE:
+            case PwsRecordV3.URL:
+            case PwsRecordV3.USERNAME:
+            case PwsRecordV3.PASSWORD_HISTORY:
+            {
+                if (!TextUtils.isEmpty(str)) {
+                    field = new PwsStringUnicodeField(fieldId, str);
+                }
+                break;
+            }
+            case PwsRecordV3.PASSWORD:
+            {
+                if (!TextUtils.isEmpty(str)) {
+                    field = new PwsPasswdUnicodeField(fieldId, str, itsPwsFile);
+                }
+                break;
+            }
+            default:
+            {
+                fieldId = FIELD_UNSUPPORTED;
+                break;
+            }
+            }
+            break;
+        }
+        case PwsFileV2.VERSION:
+        {
+            switch (fieldId)
+            {
+            case PwsRecordV3.GROUP:
+            case PwsRecordV3.NOTES:
+            case PwsRecordV3.TITLE:
+            case PwsRecordV3.USERNAME:
+            {
+                if (!TextUtils.isEmpty(str)) {
+                    field = new PwsStringField(fieldId, str);
+                }
+                break;
+            }
+            case PwsRecordV3.PASSWORD:
+            {
+                if (!TextUtils.isEmpty(str)) {
+                    field = new PwsPasswdField(fieldId, str, itsPwsFile);
+                }
+                break;
+            }
+            default:
+            {
+                fieldId = FIELD_UNSUPPORTED;
+                break;
+            }
+            }
+            break;
+        }
+        default:
+        {
+            fieldId = FIELD_UNSUPPORTED;
+            break;
+        }
+        }
+
+        if (fieldId != FIELD_UNSUPPORTED) {
+            if (field != null) {
+                rec.setField(field);
+            } else {
+                rec.removeField(fieldId);
+            }
+        }
+    }
+
+    private final void finishOpenFile(StringBuilder passwd)
+    {
+        for (int i = 0; i < passwd.length(); ++i) {
+            passwd.setCharAt(i, '\0');
+        }
+        passwd.delete(0, passwd.length());
+        passwd = null;
+        PasswdSafeApp.dbginfo(TAG, "after load file");
+        indexRecords();
+        PasswdSafeApp.dbginfo(TAG, "file loaded");
+    }
+
+    private final void indexRecords()
+    {
+        itsRecords.clear();
+        itsRecords.ensureCapacity(itsPwsFile.getRecordCount());
+        itsRecordsByUUID.clear();
+        Iterator<PwsRecord> recIter = itsPwsFile.getRecords();
+        while (recIter.hasNext()) {
+            PwsRecord rec = recIter.next();
+            String uuid = getUUID(rec);
+            if (uuid == null) {
+                // Add a UUID field for records without one.  The record will
+                // not be marked as modified unless the user manually edits it.
+                PwsUUIDField uuidField =
+                    new PwsUUIDField(isV2() ?
+                                     PwsFieldTypeV2.UUID : PwsFieldTypeV3.UUID,
+                                     new UUID());
+                boolean modified = rec.isModified();
+                rec.setField(uuidField);
+                if (!modified) {
+                    rec.resetModified();
+                }
+                uuid = uuidField.toString();
+            }
+
+            itsRecords.add(rec);
+            itsRecordsByUUID.put(uuid, rec);
+        }
+    }
+
+
+    private static String getSaveFileName(File file, boolean isV3)
+    {
+        String name = file.getName();
+        Pattern pat = Pattern.compile("^(.*)_\\d{8}_\\d{6}\\.ibak$");
+        Matcher match = pat.matcher(name);
+        if ((match != null) && match.matches()) {
+            name = match.group(1);
+            if (isV3) {
+                name += ".psafe3";
+            } else {
+                name += ".dat";
+            }
+        }
+        return name;
+    }
+
+
+    private static void createBackupFile(File fromFile, File toFile,
+                                         Context context)
+        throws IOException
+    {
+        SharedPreferences prefs =
+                        PreferenceManager.getDefaultSharedPreferences(context);
+        FileBackupPref backupPref = Preferences.getFileBackupPref(prefs);
+
+        File dir = toFile.getParentFile();
+        String fileName = toFile.getName();
+        int dotpos = fileName.lastIndexOf('.');
+        if (dotpos != -1) {
+            fileName = fileName.substring(0, dotpos);
+        }
+
+        final Pattern pat = Pattern.compile(
+            "^" + Pattern.quote(fileName) + "_\\d{8}_\\d{6}\\.ibak$");
+        File[] backupFiles = dir.listFiles(new FileFilter() {
+            public boolean accept(File f)
+            {
+                return f.isFile() && pat.matcher(f.getName()).matches();
+            }
+        });
+        if (backupFiles != null) {
+            Arrays.sort(backupFiles);
+
+            int numBackups = backupPref.getNumBackups();
+            if (numBackups > 0) {
+                --numBackups;
+            }
+            for (int i = 0, numFiles = backupFiles.length;
+                 numFiles > numBackups; ++i, --numFiles) {
+                if (!backupFiles[i].equals(fromFile)) {
+                    backupFiles[i].delete();
+                }
+            }
+        }
+
+        if (backupPref != FileBackupPref.BACKUP_NONE) {
+            SimpleDateFormat bakTime = new SimpleDateFormat("yyyyMMdd_HHmmss");
+            StringBuilder bakName = new StringBuilder(fileName);
+            bakName.append("_");
+            bakName.append(bakTime.format(new Date()));
+            bakName.append(".ibak");
+
+            File bakFile = new File(dir, bakName.toString());
+            if (!toFile.renameTo(bakFile)) {
+                throw new IOException("Can not create backup file: " + bakFile);
+            }
+        }
+    }
+
+
+    private static final int getHdrMinorVersion(PwsRecord rec)
+    {
+        PwsField ver = doGetField(rec, PwsRecordV3.HEADER_VERSION);
+        if (ver == null) {
+            return -1;
+        }
+        byte[] bytes = ver.getBytes();
+        if ((bytes == null) || (bytes.length == 0)) {
+            return -1;
+        }
+        return bytes[0];
+    }
+
+    private static final String getHdrLastSaveWhoField(PwsRecord rec,
+                                                       boolean isUser)
+    {
+        PwsField field = doGetField(rec, PwsRecordV3.HEADER_LAST_SAVE_WHO);
+        if (field == null) {
+            return null;
+        }
+
+        String str = doHdrFieldToString(field);
+        if (str == null) {
+            return null;
+        }
+
+        if (str.length() < 4) {
+            Log.e(TAG, "Invalid who length: " + str.length());
+            return null;
+        }
+        int len = Integer.parseInt(str.substring(0, 4), 16);
+
+        if ((len + 4) > str.length()) {
+            Log.e(TAG, "Invalid user length: " + (len + 4));
+            return null;
+        }
+
+        if (isUser) {
+            return str.substring(4, len + 4);
+        } else {
+            return str.substring(len + 4);
+        }
+    }
+
+
+    private static final void setHdrLastSaveWhoField(PwsRecord rec,
+                                                     String user, String host)
+    {
+        StringBuilder who = new StringBuilder();
+        who.append(String.format("%04x", user.length()));
+        who.append(user);
+        who.append(host);
+        doSetHdrFieldString(rec, PwsRecordV3.HEADER_LAST_SAVE_WHO,
+                            who.toString());
+    }
+}
