@@ -1,0 +1,17 @@
+^box-lib/bin
+^box-lib/local.properties
+^box-lib/gen
+^lib/bin
+^lib/local.properties
+^lib/gen
+^passwdsafe/bin
+^passwdsafe/local.properties
+^passwdsafe/gen
+^sync/bin
+^sync/local.properties
+^sync/gen
+^sync-dropbox/bin
+^sync-dropbox/local.properties
+^sync-dropbox/gen
+^tests/bin
+^tests/gen
